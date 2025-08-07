@@ -21,9 +21,19 @@ import sys
 import smtplib
 from datetime import datetime, timedelta, date
 from typing import Optional, Tuple, Dict, Any, List
+from dotenv import load_dotenv
 
 import pandas as pd
 import numpy as np
+
+from email.mime.multipart import MIMEMultipart
+from email.mime.text import MIMEText
+
+from jinja2 import Environment, FileSystemLoader, select_autoescape
+# Load environment variables from .env file if it exists
+load_dotenv()
+# Ensure that the script is run with Python 3.6 or later
+
 
 try:
     # clickhouse_connect may not be installed in every environment.  If it's
@@ -39,11 +49,6 @@ try:
     from google.cloud import bigquery  # type: ignore
 except ImportError:
     bigquery = None  # type: ignore
-
-from email.mime.multipart import MIMEMultipart
-from email.mime.text import MIMEText
-
-from jinja2 import Environment, FileSystemLoader, select_autoescape
 
 
 def run_clickhouse_query(
