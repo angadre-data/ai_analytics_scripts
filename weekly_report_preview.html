@@ -58,25 +58,25 @@
 </head>
 <body>
     <div class="container">
-        <h1>Weekly Analytics Report for {{ site | capitalize }}</h1>
-        <p><strong>Week:</strong> {{ summary.report_date }}</p>
-        <p><strong>Overall performance:</strong> Your numbers were <strong>{{ summary.pv_trend }}</strong> compared to the last four weeks.</p>
+        <h1>Weekly Analytics Report for Torontolife</h1>
+        <p><strong>Week:</strong> July 28 - August 03, 2025</p>
+        <p><strong>Overall performance:</strong> Your numbers were <strong>normal</strong> compared to the last four weeks.</p>
         <div class="metrics">
             <div class="metric">
-                <div class="metric-value">{{ summary.total_engaged_minutes | round }}</div>
+                <div class="metric-value">110000</div>
                 <div class="metric-label">Engaged Minutes</div>
             </div>
             <div class="metric">
-                <div class="metric-value">{{ summary.latest_pageviews }}</div>
+                <div class="metric-value">546311</div>
                 <div class="metric-label">Pageviews</div>
             </div>
             <div class="metric">
-                <div class="metric-value">{{ summary.avg_engagement_time }}</div>
+                <div class="metric-value">1:35</div>
                 <div class="metric-label">Avg. Engagement Time</div>
             </div>
         </div>
-        <p>Pageviews vs baseline: {{ summary.pv_percent_change }}% ({{ summary.pv_trend | capitalize }})</p>
-        <p>Total engaged time trend: {{ summary.engaged_minutes_trend | capitalize }}</p>
+        <p>Pageviews vs baseline: -4.8% (Normal)</p>
+        <p>Total engaged time trend: High</p>
         <div class="footer">
             <p>This report was generated automatically. For questions, contact the analytics team.</p>
         </div>
