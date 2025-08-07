@@ -58,9 +58,9 @@
 </head>
 <body>
     <div class="container">
-        <h1>Daily Analytics Report for {{ site | capitalize }}</h1>
-        <p><strong>Date:</strong> {{ summary.report_date }}</p>
-        <p><strong>Overall performance:</strong> Your numbers were <strong>{{ summary.pv_trend }}</strong> compared to the last four {{ summary.report_date.split(',')[0] }}s.</p>
+        <h1>Weekly Analytics Report for {{ site | capitalize }}</h1>
+        <p><strong>Week:</strong> {{ summary.report_date }}</p>
+        <p><strong>Overall performance:</strong> Your numbers were <strong>{{ summary.pv_trend }}</strong> compared to the last four weeks.</p>
         <div class="metrics">
             <div class="metric">
                 <div class="metric-value">{{ summary.total_engaged_minutes | round }}</div>

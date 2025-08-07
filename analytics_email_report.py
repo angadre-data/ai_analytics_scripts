@@ -243,14 +243,14 @@ def run_bigquery_query(
 def compute_summary_metrics(
     clickhouse_df: pd.DataFrame,
     bigquery_df: pd.DataFrame,
-    report_date: date,
+    week_end_date: date,
     lookback: int = 4,
 ) -> Dict[str, Any]:
-    """Compute high‑level summary metrics and trends.
+    """Compute high‑level summary metrics and trends for weekly reporting.
 
-    This function calculates the latest metrics (pageviews, engaged minutes, etc.)
-    and compares them to the average of the same weekday over the previous
-    `lookback` periods to determine if the numbers are high or low.
+    This function calculates weekly metrics by aggregating daily data from the
+    previous Monday-Sunday week and compares them to the average of the previous
+    `lookback` weeks to determine if the numbers are high or low.
 
     Parameters
     ----------
@@ -258,51 +258,51 @@ def compute_summary_metrics(
         DataFrame returned by run_clickhouse_query.
     bigquery_df : pd.DataFrame
         DataFrame returned by run_bigquery_query.
-    report_date : date
-        The date of the report (typically yesterday).
+    week_end_date : date
+        The end date of the week being reported (typically last Sunday).
     lookback : int
-        Number of previous occurrences of the same weekday to include in the
-        baseline average for trend comparison.
+        Number of previous weeks to include in the baseline average for trend comparison.
 
     Returns
     -------
     Dict[str, Any]
         A dictionary containing summary metrics and trend labels.
     """
-    # Extract latest ClickHouse metrics for the report date.
-    latest_row = clickhouse_df.loc[clickhouse_df['day'].dt.date == report_date]
-    if latest_row.empty:
-        raise ValueError(f"No ClickHouse data found for report date {report_date}")
-    latest_row = latest_row.iloc[0]
-    latest_pageviews = int(latest_row['page_views'])
-    latest_sessions = int(latest_row['sessions'])
-    latest_pps = float(latest_row['pps'])
+    week_start_date = week_end_date - timedelta(days=6)
+    
+    # Extract ClickHouse metrics for the entire week
+    week_mask = (clickhouse_df['day'].dt.date >= week_start_date) & (clickhouse_df['day'].dt.date <= week_end_date)
+    week_data = clickhouse_df.loc[week_mask]
+    
+    if week_data.empty:
+        raise ValueError(f"No ClickHouse data found for week {week_start_date} to {week_end_date}")
+    
+    weekly_pageviews = int(week_data['page_views'].sum())
+    weekly_sessions = int(week_data['sessions'].sum())
+    weekly_pps = weekly_pageviews / weekly_sessions if weekly_sessions > 0 else 0
 
-    # Extract BigQuery engagement metrics.  Since bigquery_df is aggregated over
-    # multiple days, we'll simply use the values as provided.  If you need
-    # day‑specific metrics, modify run_bigquery_query accordingly.
+    # Extract BigQuery engagement metrics (already aggregated over the date range)
     bq_row = bigquery_df.iloc[0]
     total_engaged_minutes = float(bq_row['total_engaged_minutes'])
     avg_engagement_sec = float(bq_row['avg_engagement_time_per_session_sec'])
 
-    # Compute baseline averages for comparison.  Identify previous dates that
-    # share the same weekday as the report date.  We'll take up to `lookback`
-    # previous days (excluding the current date).
-    weekday = report_date.weekday()
-    mask = (clickhouse_df['day'].dt.weekday == weekday) & (clickhouse_df['day'].dt.date < report_date)
-    previous_dates = clickhouse_df.loc[mask].sort_values('day', ascending=False).head(lookback)
-    if previous_dates.empty:
-        baseline_pageviews = latest_pageviews
-        baseline_engaged_minutes = total_engaged_minutes
+    # Compute baseline averages for comparison using previous weeks
+    baseline_weeks = []
+    for i in range(1, lookback + 1):
+        baseline_week_end = week_end_date - timedelta(weeks=i)
+        baseline_week_start = baseline_week_end - timedelta(days=6)
+        baseline_mask = (clickhouse_df['day'].dt.date >= baseline_week_start) & (clickhouse_df['day'].dt.date <= baseline_week_end)
+        baseline_week_data = clickhouse_df.loc[baseline_mask]
+        if not baseline_week_data.empty:
+            baseline_weeks.append(baseline_week_data['page_views'].sum())
+    
+    if baseline_weeks:
+        baseline_pageviews = sum(baseline_weeks) / len(baseline_weeks)
     else:
-        baseline_pageviews = previous_dates['page_views'].mean()
-        # For engaged minutes baseline, use the BigQuery total engaged minutes as
-        # a proxy.  In a production environment you should compute daily
-        # engagement times per date from GA4 instead.
-        baseline_engaged_minutes = total_engaged_minutes  # simplified baseline
+        baseline_pageviews = weekly_pageviews
 
     # Determine whether the latest metrics are high or low compared to baseline.
-    pv_difference = latest_pageviews - baseline_pageviews
+    pv_difference = weekly_pageviews - baseline_pageviews
     pv_percent_change = (pv_difference / baseline_pageviews) * 100 if baseline_pageviews != 0 else 0
     pv_trend = 'high' if pv_percent_change > 10 else 'low' if pv_percent_change < -10 else 'normal'
 
@@ -315,10 +315,10 @@ def compute_summary_metrics(
     avg_time_str = f"{avg_minutes}:{avg_seconds:02d}"
 
     return {
-        'report_date': report_date.strftime('%A, %B %d, %Y'),
-        'latest_pageviews': latest_pageviews,
-        'latest_sessions': latest_sessions,
-        'latest_pps': round(latest_pps, 2),
+        'report_date': f"{week_start_date.strftime('%B %d')} - {week_end_date.strftime('%B %d, %Y')}",
+        'latest_pageviews': weekly_pageviews,
+        'latest_sessions': weekly_sessions,
+        'latest_pps': round(weekly_pps, 2),
         'total_engaged_minutes': round(total_engaged_minutes),
         'avg_engagement_time': avg_time_str,
         'pv_percent_change': round(pv_percent_change, 1),
@@ -403,11 +403,16 @@ def main():
     # deployment environment or exported before running the script.  Default
     # values are provided for demonstration purposes.
     property_name = os.getenv('PROPERTY_NAME', 'torontolife')
-    # Report date is typically yesterday; adjust timezone as needed.  We'll
-    # interpret the current timezone as America/Toronto.
+    # We'll interpret the current timezone as America/Toronto.
     tz_offset_hours = -4  # EDT offset from UTC during summer (Toronto)
     today_utc = datetime.utcnow()
-    report_date_local = (today_utc + timedelta(hours=tz_offset_hours)).date() - timedelta(days=1)
+    today_local = (today_utc + timedelta(hours=tz_offset_hours)).date()
+    
+    days_since_monday = today_local.weekday()  # Monday = 0, Sunday = 6
+    last_monday = today_local - timedelta(days=days_since_monday + 7)  # Previous week's Monday
+    last_sunday = last_monday + timedelta(days=6)  # Previous week's Sunday
+    
+    report_date_local = last_sunday
 
     # ClickHouse configuration
     ch_host = os.getenv('CLICKHOUSE_HOST', 'clickhouse.statera.internal')
@@ -418,11 +423,11 @@ def main():
     bq_project = os.getenv('BQ_PROJECT_ID', 'your_project_id')
     bq_dataset = os.getenv('BQ_DATASET_ID', 'your_dataset_id')
 
-    # Date range for queries: past 28 days for ClickHouse, past 28 days for BigQuery
+    # Date range for queries: past 28 days to ensure we have enough data for weekly baselines
     ch_end = report_date_local + timedelta(days=1)
     ch_start = ch_end - timedelta(days=28)
     bq_end = report_date_local + timedelta(days=1)
-    bq_start = bq_end - timedelta(days=28)
+    bq_start = bq_end - timedelta(days=7)  # Only need the current week for BigQuery
 
     # Run queries
     ch_df = run_clickhouse_query(
@@ -456,7 +461,7 @@ def main():
     html_body = render_email(template_path, context)
 
     # Output the rendered HTML to a file for inspection
-    output_html_path = os.path.join(os.path.dirname(__file__), 'daily_report_preview.html')
+    output_html_path = os.path.join(os.path.dirname(__file__), 'weekly_report_preview.html')
     with open(output_html_path, 'w', encoding='utf-8') as f:
         f.write(html_body)
     print(f"Preview report saved to {output_html_path}")
@@ -470,7 +475,7 @@ def main():
         smtp_port = int(os.getenv('SMTP_PORT', '25'))
         smtp_user = os.getenv('SMTP_USER')
         smtp_password = os.getenv('SMTP_PASSWORD')
-        subject = f"Daily analytics report for {property_name} ({summary['report_date']})"
+        subject = f"Weekly analytics report for {property_name} ({summary['report_date']})"
         send_email(subject, html_body, from_addr, to_addrs, smtp_host, smtp_port, smtp_user, smtp_password)
     else:
         print("Email not sent. To enable sending, set SEND_EMAIL=true and configure SMTP settings.")
