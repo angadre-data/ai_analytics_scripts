@@ -14,6 +14,7 @@ pipelines.  If connectivity to ClickHouse or BigQuery is not available in
 your environment, the script will still run and produce a sample report using
 mocked data.  Replace the mocked data with real query results when running
 in production.
+
 """
 
 import os
