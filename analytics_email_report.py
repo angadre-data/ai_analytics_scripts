@@ -390,8 +390,9 @@ def send_email(
 
     with smtplib.SMTP(smtp_host, smtp_port) as server:
         server.ehlo()
-        if smtp_user and smtp_password:
+        if smtp_port == 587 or smtp_host.endswith('.gmail.com'):
             server.starttls()
+        if smtp_user and smtp_password:
             server.login(smtp_user, smtp_password)
         server.sendmail(from_addr, to_addrs, msg.as_string())
 
