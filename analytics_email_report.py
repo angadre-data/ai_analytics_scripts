@@ -20,7 +20,7 @@ in production.
 import os
 import sys
 import smtplib
-from datetime import datetime, timedelta, date
+from datetime import datetime, timedelta, date, timezone
 from typing import Optional, Tuple, Dict, Any, List
 from dotenv import load_dotenv
 
@@ -394,7 +394,6 @@ def send_email(
             server.starttls()
             server.login(smtp_user, smtp_password)
         server.sendmail(from_addr, to_addrs, msg.as_string())
-    print("Email sent successfully.")
 
 
 def main():
@@ -405,7 +404,7 @@ def main():
     property_name = os.getenv('PROPERTY_NAME', 'torontolife')
     # We'll interpret the current timezone as America/Toronto.
     tz_offset_hours = -4  # EDT offset from UTC during summer (Toronto)
-    today_utc = datetime.utcnow()
+    today_utc = datetime.now(timezone.utc)
     today_local = (today_utc + timedelta(hours=tz_offset_hours)).date()
     
     days_since_monday = today_local.weekday()  # Monday = 0, Sunday = 6
@@ -476,7 +475,15 @@ def main():
         smtp_user = os.getenv('SMTP_USER')
         smtp_password = os.getenv('SMTP_PASSWORD')
         subject = f"Weekly analytics report for {property_name} ({summary['report_date']})"
-        send_email(subject, html_body, from_addr, to_addrs, smtp_host, smtp_port, smtp_user, smtp_password)
+        try:
+            send_email(subject, html_body, from_addr, to_addrs, smtp_host, smtp_port, smtp_user, smtp_password)
+            print(f"Email sent successfully to {', '.join(to_addrs)}")
+        except ConnectionRefusedError:
+            print(f"ERROR: Could not connect to SMTP server at {smtp_host}:{smtp_port}")
+            print("Please check your SMTP configuration or set SEND_EMAIL=false to skip email sending.")
+        except Exception as e:
+            print(f"ERROR: Failed to send email: {e}")
+            print("Please check your SMTP configuration or set SEND_EMAIL=false to skip email sending.")
     else:
         print("Email not sent. To enable sending, set SEND_EMAIL=true and configure SMTP settings.")
 
