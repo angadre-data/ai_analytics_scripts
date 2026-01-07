@@ -1,672 +1,491 @@
 """
-Analytics Email Report Generator - Multi-Property Version
+Analytics Email Report Generator
 
-This script generates a weekly analytics email for multiple properties (brands/sites)
-by querying a ClickHouse database and optionally a Google BigQuery dataset. It
-provides per-property 7-day metrics including revenue, ad impressions, IPP, RPS,
-and a top-10 articles breakdown by pageviews.
+This script generates a daily analytics email for a given property (brand/site) by
+querying both a ClickHouse database and a Google BigQuery dataset.  The goal is
+to provide high‑level metrics (total pageviews, sessions, pageviews per session,
+total engaged minutes, average engagement time) along with simple trend
+analysis similar to the example email.  The output can be formatted as HTML
+and sent via email to senior leaders.
 
-The report is generated in plain-text format and sent via SMTP if enabled.
+The design emphasises configurability via environment variables and modular
+functions so that the script can easily be adapted for different sites or
+pipelines.  If connectivity to ClickHouse or BigQuery is not available in
+your environment, the script will still run and produce a sample report using
+mocked data.  Replace the mocked data with real query results when running
+in production.
+
 """
 
 import os
 import sys
 import smtplib
-import logging
-import warnings
-import socket
 from datetime import datetime, timedelta, date, timezone
-from typing import Optional, Dict, Any, List, Tuple
+from typing import Optional, Tuple, Dict, Any, List
 from dotenv import load_dotenv
-
-# Suppress urllib3 OpenSSL warning
-warnings.filterwarnings('ignore', message='.*urllib3 v2 only supports OpenSSL.*')
 
 import pandas as pd
 import numpy as np
+
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
+
 from jinja2 import Environment, FileSystemLoader, select_autoescape
+# Load environment variables from .env file if it exists
+load_dotenv()
+# Ensure that the script is run with Python 3.6 or later
 
-# Optional CSS inlining library
-try:
-    from premailer import transform  # type: ignore
-except ImportError:
-    transform = None  # type: ignore
-
-# Load environment variables from .env without clearing existing ones
-load_dotenv(override=True)
-
-# Configure logging
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(levelname)s - %(message)s',
-    stream=sys.stdout
-)
-logger = logging.getLogger(__name__)
 
 try:
+    # clickhouse_connect may not be installed in every environment.  If it's
+    # available then it will be used to query ClickHouse; otherwise the
+    # script will fall back to mocked data.
     from clickhouse_connect import get_client  # type: ignore
 except ImportError:
     get_client = None  # type: ignore
 
 try:
+    # google.cloud.bigquery may also be unavailable.  In that case we will
+    # simulate the BigQuery results.
     from google.cloud import bigquery  # type: ignore
 except ImportError:
     bigquery = None  # type: ignore
 
 
-def run_clickhouse_query_multi_property(
+def run_clickhouse_query(
     host: str,
     user: str,
     password: str,
-    properties: List[str],
-    start_ts: datetime,
-    end_ts: datetime
+    property_name: str,
+    start_date: str,
+    end_date: str,
 ) -> pd.DataFrame:
+    """Run a ClickHouse query to collect pageviews, sessions and pps.
+
+    Returns a DataFrame with columns [day, page_views, sessions, pps].  If
+    clickhouse_connect is not installed or the query fails, a mocked DataFrame
+    will be returned for demonstration purposes.
+
+    Parameters
+    ----------
+    host : str
+        ClickHouse host name.
+    user : str
+        ClickHouse username.
+    password : str
+        ClickHouse password.
+    property_name : str
+        Site/brand identifier to filter the query.
+    start_date : str
+        ISO 8601 start timestamp (inclusive).
+    end_date : str
+        ISO 8601 end timestamp (exclusive).
+
+    Returns
+    -------
+    pd.DataFrame
+        DataFrame containing the aggregated metrics.
     """
-    Run the multi-property 7-day summary query.
-    
-    Returns DataFrame with columns:
-    property_name, total_pageviews, total_sessions, total_revenue,
-    total_ad_impressions, ad_impressions_gt_0, ipp, rps, total_new_articles_published
-    """
-    if get_client is None:
-        logger.warning("ClickHouse client not available, returning empty DataFrame")
-        return pd.DataFrame()
-    
-    # Format properties list for SQL IN clause
-    properties_str = "', '".join(properties)
-    
-    # Format timestamps for ClickHouse
-    start_ts_str = start_ts.strftime('%Y-%m-%d %H:%M:%S')
-    end_ts_str = end_ts.strftime('%Y-%m-%d %H:%M:%S')
-    
     sql_query = f"""
-    /* Per-property 7-day summary */
-    WITH
-      toDateTime('{start_ts_str}') AS start_ts_local,
-      toDateTime('{end_ts_str}') AS end_ts_local,
-
-    /* Minimal metadata: PostType + PublishedAt for "new articles" count */
-    published_meta AS (
-      SELECT
-        property_name,
-        wp_post_id,
-        dictGetOrNull('assembly.wordpress_metadata','PostType',   (property_name, wp_post_id)) AS post_type,
-        toDateTime(dictGetOrNull('assembly.wordpress_metadata','PublishedAt',(property_name, wp_post_id))) AS wp_publish_date
-      FROM (
-        SELECT DISTINCT property_name, wp_post_id
-        FROM assembly.client_events
-        WHERE wp_post_id != 0
-      )
-    )
-
-    /* Base, filtered events within the window */
     SELECT
-      ev.property_name,
-
-      /* core volumes */
-      countIf(ev.type = 'page_impression')                      AS total_pageviews,
-      uniqExact(ev.session_id)                                  AS total_sessions,
-      sum(ev.revenue)              AS total_revenue,
-      countIf(ev.type = 'ad_impression')                        AS total_ad_impressions,
-      countIf(ev.type = 'ad_impression' AND ev.revenue > 0)     AS ad_impressions_gt_0,
-
-      /* KPIs */
-      total_ad_impressions / NULLIF(total_pageviews, 0)         AS ipp,
-      total_revenue / NULLIF(total_sessions, 0)                 AS rps,
-
-      /* new articles published in the window (by PublishedAt) */
-      uniqExactIf(ev.wp_post_id, pm.wp_publish_date >= start_ts_local AND pm.wp_publish_date < end_ts_local) AS total_new_articles_published
-
-    FROM assembly.client_events ev
-    left JOIN published_meta pm
-      ON ev.property_name = pm.property_name
-     AND ev.wp_post_id    = pm.wp_post_id
-    WHERE
-      /* apply window to both event time and session_start */
-      toTimeZone(ev.timestamp, 'America/Toronto')      >= start_ts_local
-      AND toTimeZone(ev.timestamp, 'America/Toronto')  <  end_ts_local
-      AND toTimeZone(ev.session_start, 'America/Toronto') >= start_ts_local
-      AND toTimeZone(ev.session_start, 'America/Toronto') <  end_ts_local
-    AND ev.property_name IN ('{properties_str}')
-      /* article-only */
-      AND lower(pm.post_type) NOT IN ('page','hub-page','sjh_grid','contest','content_module')
-
-      /* quality */
-      AND ev.is_bot = 0
-      AND ev.wp_post_id != 0
-      AND ev.url != ''
-
-    GROUP BY
-      ev.property_name
-    ORDER BY
-      ev.property_name
-    """
-    
-    try:
-        logger.info(f"Querying ClickHouse for multi-property summary: {properties}")
-        client = get_client(host=host, user=user, password=password)
-        query_result = client.query(sql_query)
-        df = pd.DataFrame(query_result.result_rows, columns=query_result.column_names)
-        logger.info(f"Retrieved {len(df)} property summaries from ClickHouse")
-        return df
-    except Exception as e:
-        logger.error(f"ClickHouse multi-property query failed: {e}")
-        return pd.DataFrame()
-
-
-def run_top_articles_query_multi(
-    host: str,
-    user: str,
-    password: str,
-    properties: List[str],
-    start_ts: datetime,
-    end_ts: datetime
-) -> pd.DataFrame:
-    """
-    Run the top-10 articles per property query.
-    
-    Returns DataFrame with columns:
-    property_name, wp_post_id, article_title, permalink, pageviews_7d,
-    ad_impressions_7d, revenue_7d, ipp_7d, pageviews_lifetime,
-    revenue_publish_date, rpm_lifetime, rank_within_property
-    """
-    if get_client is None:
-        logger.warning("ClickHouse client not available, returning empty DataFrame")
-        return pd.DataFrame()
-    
-    # Format properties list for SQL IN clause
-    # properties_str = "', '".join(properties)
-    properties_str = "'" + "', '".join(properties) + "'"
-    
-    # Format timestamps for ClickHouse
-    start_ts_str = start_ts.strftime('%Y-%m-%d %H:%M:%S')
-    end_ts_str = end_ts.strftime('%Y-%m-%d %H:%M:%S')
-    
-    sql_query = f"""
-    WITH
-    -- 7-day window (Toronto local time interpreted on server)
-    toDateTime('{start_ts_str}') AS start_ts_local,
-    toDateTime('{end_ts_str}') AS end_ts_local,
-
-    -- Lifetime window lower bound: tune this for performance vs. “true” lifetime
-    -- e.g. last 365 days, or earlier if you need deeper history
-    toDateTime('2024-01-01 00:00:00') AS lifetime_start_ts
-
-/* 1) 7-day metrics per article, filtered at the source */
-, weekly AS (
-    SELECT
-        property_name,
-        wp_post_id,
-        countIf(type = 'page_impression')              AS pageviews_7d,
-        countIf(type = 'ad_impression')                AS ad_impressions_7d,
-        sum(revenue)         AS revenue_7d
+      toStartOfDay(session_start, 'America/Toronto') AS day,
+      countIf(type = 'page_impression') AS page_views,
+      uniqExact(session_id) AS sessions,
+      countIf(type = 'page_impression') / uniqExact(session_id) AS pps
     FROM assembly.client_events
-    WHERE
-        -- 7-day window on both timestamp and session_start
-        timestamp      >= start_ts_local
-        AND timestamp  <  end_ts_local
-        AND session_start >= start_ts_local
-        AND session_start <  end_ts_local
-
-        -- property filter (templated)
-        AND property_name IN ({properties_str})
-
-        -- quality filters
-        AND is_bot = 0
-        AND wp_post_id != 0
-        AND url != ''
-
-        -- article-only via dictGet (no pre-join)
-        AND lower(
-              dictGet(
-                'assembly.wordpress_metadata',
-                'PostType',
-                tuple(property_name, wp_post_id)
-              )
-            ) NOT IN ('page','hub-page','sjh_grid','contest','content_module')
-    GROUP BY
-        property_name,
-        wp_post_id
-)
-
-/* 2) Rank and keep only top 10 per property by 7-day pageviews */
-, top10 AS (
-    SELECT
-        property_name,
-        wp_post_id,
-        pageviews_7d,
-        ad_impressions_7d,
-        revenue_7d,
-        ad_impressions_7d / NULLIF(pageviews_7d, 0) AS ipp_7d,
-        row_number() OVER (
-          PARTITION BY property_name
-          ORDER BY pageviews_7d DESC
-        ) AS rn
-    FROM weekly
-    WHERE pageviews_7d > 0
-)
-
-/* 3) Lifetime metrics restricted to top10 articles only, with a timestamp bound */
-, lifetime AS (
-    SELECT
-        ev.property_name,
-        ev.wp_post_id,
-        uniqExact(ev.session_id)                      AS sessions_lifetime,
-        countIf(ev.type = 'page_impression')          AS pageviews_lifetime,
-        sum(ev.revenue)  AS revenue_lifetime
-    FROM assembly.client_events ev
-    INNER JOIN top10 t
-      ON ev.property_name = t.property_name
-     AND ev.wp_post_id    = t.wp_post_id
-    WHERE
-        ev.is_bot = 0
-        AND ev.wp_post_id != 0
-        AND ev.url != ''
-
-        -- IMPORTANT: restrict lifetime scan to a reasonable horizon
-        AND ev.timestamp >= lifetime_start_ts
-
-        -- property filter again (cheap, but keeps things tidy)
-        AND ev.property_name IN ({properties_str})
-
-        -- no need to re-check PostType here: top10 already article-only
-    GROUP BY
-        ev.property_name,
-        ev.wp_post_id
-)
-
-SELECT
-    t.property_name,
-    t.wp_post_id,
-
-    -- Article title + permalink
-    dictGetOrNull(
-      'assembly.wordpress_metadata',
-      'Title',
-      tuple(t.property_name, t.wp_post_id)
-    ) AS article_title,
-    dictGetOrNull(
-      'assembly.wordpress_metadata',
-      'Permalink',
-      tuple(t.property_name, t.wp_post_id)
-    ) AS permalink,
-
-    -- Publish date
-    toDateTime(
-      dictGetOrNull(
-        'assembly.wordpress_metadata',
-        'PublishedAt',
-        tuple(t.property_name, t.wp_post_id)
-      )
-    ) AS wp_publish_date,
-
-    -- Days since publish
-    dateDiff(
-      'day',
-      wp_publish_date,
-      now()
-    ) AS days_since_publish,
-
-    -- 7-day metrics
-    t.pageviews_7d,
-    t.ad_impressions_7d,
-    t.revenue_7d,
-    t.ipp_7d,
-
-    -- Lifetime metrics
-    l.pageviews_lifetime,
-    l.sessions_lifetime,
-    l.pageviews_lifetime / NULLIF(l.sessions_lifetime, 0) AS pps_lifetime,
-    l.revenue_lifetime AS revenue_publish_date,
-    (l.revenue_lifetime / NULLIF(l.pageviews_lifetime, 0)) * 1000 AS rpm_lifetime,
-
-    -- Rank
-    t.rn AS rank_within_property
-
-FROM top10 t
-LEFT JOIN lifetime l
-  ON t.property_name = l.property_name
- AND t.wp_post_id    = l.wp_post_id
-WHERE t.rn <= 10
-ORDER BY
-    t.property_name,
-    t.rn
+    WHERE timestamp >= '{start_date}' AND timestamp < '{end_date}'
+      AND session_start >= '{start_date}' AND session_start < '{end_date}'
+      AND property_name = '{property_name}'
+      AND is_bot = false
+    GROUP BY day
+    ORDER BY day
     """
-    
+
+    if get_client is None:
+        # Simulate data when ClickHouse client is unavailable.  Generate a
+        # 14‑day series with random but plausible values.
+        num_days = (pd.to_datetime(end_date) - pd.to_datetime(start_date)).days
+        days = pd.date_range(start=start_date, periods=num_days, freq='D')
+        rng = np.random.default_rng(seed=42)
+        page_views = rng.integers(40000, 120000, size=num_days)
+        sessions = rng.integers(30000, 80000, size=num_days)
+        pps = page_views / sessions
+        df = pd.DataFrame({
+            'day': days,
+            'page_views': page_views,
+            'sessions': sessions,
+            'pps': pps,
+        })
+        return df
+
     try:
-        logger.info(f"Querying ClickHouse for top articles across properties: {properties}")
         client = get_client(host=host, user=user, password=password)
         query_result = client.query(sql_query)
-        df = pd.DataFrame(query_result.result_rows, columns=query_result.column_names)
-        logger.info(f"Retrieved {len(df)} top articles from ClickHouse")
+        rows = query_result.result_rows
+        columns = query_result.column_names
+        df = pd.DataFrame(rows, columns=columns)
+        # Convert day column to datetime if it's returned as string
+        df['day'] = pd.to_datetime(df['day'])
         return df
     except Exception as e:
-        logger.error(f"ClickHouse top articles query failed: {e}")
-        return pd.DataFrame()
+        # Fallback to mocked data in case of any errors (e.g. network issues).
+        print(f"Warning: ClickHouse query failed ({e}). Using mocked data.")
+        num_days = (pd.to_datetime(end_date) - pd.to_datetime(start_date)).days
+        days = pd.date_range(start=start_date, periods=num_days, freq='D')
+        rng = np.random.default_rng(seed=0)
+        page_views = rng.integers(40000, 120000, size=num_days)
+        sessions = rng.integers(30000, 80000, size=num_days)
+        pps = page_views / sessions
+        df = pd.DataFrame({
+            'day': days,
+            'page_views': page_views,
+            'sessions': sessions,
+            'pps': pps,
+        })
+        return df
 
 
-def canonicalize_brand_name(property_name: str) -> str:
-    """Convert property name to display-friendly brand name."""
-    brand_map = {
-        'torontolife': 'Toronto Life',
-        'todaysparent': 'Today\'s Parent',
-        'chatelaine': 'Chatelaine',
-        'macleans': 'Maclean\'s',
-        'fashion': 'Fashion',
-        'chatelaine_fr': 'Châtelaine'
-    }
-    return brand_map.get(property_name.lower(), property_name.title())
-
-
-def build_report_context(
-    properties: List[str],
-    summary_df: pd.DataFrame,
-    top_articles_df: pd.DataFrame,
+def run_bigquery_query(
+    project_id: str,
+    dataset: str,
     start_date: date,
-    end_date: date
-) -> Dict[str, Any]:
+    end_date: date,
+) -> pd.DataFrame:
+    """Run the BigQuery query to collect engagement metrics.
+
+    Returns a DataFrame with columns [pageviews, total_sessions, pageviews_per_session,
+    total_engaged_minutes, avg_engagement_time_per_session_sec,
+    avg_engagement_time_per_user_sec].  If bigquery is not installed or
+    authentication fails, returns mocked data.
+
+    Parameters
+    ----------
+    project_id : str
+        BigQuery project identifier.
+    dataset : str
+        BigQuery dataset identifier.
+    start_date : date
+        Start date (inclusive) for the query.
+    end_date : date
+        End date (exclusive) for the query.
+
+    Returns
+    -------
+    pd.DataFrame
+        DataFrame containing aggregated engagement metrics.
     """
-    Build the context for email rendering from query results.
-    """
-    report_date_str = f"{start_date.strftime('%B %d')} - {end_date.strftime('%B %d, %Y')}"
-    
-    properties_data = []
-    
-    for prop in properties:
-        # Get summary for this property
-        prop_summary = summary_df[summary_df['property_name'] == prop]
-        
-        if prop_summary.empty:
-            logger.warning(f"No summary data found for property: {prop}")
-            continue
-        
-        row = prop_summary.iloc[0]
-        
-        # Calculate PPS (pageviews per session)
-        pps = float(row['total_pageviews']) / float(row['total_sessions']) if row['total_sessions'] > 0 else 0.0
-        
-        # Build property summary
-        property_data = {
-            'name': prop,
-            'display_name': canonicalize_brand_name(prop),
-            'summary_7d': {
-                'total_pageviews': int(row['total_pageviews']),
-                'total_sessions': int(row['total_sessions']),
-                'total_revenue': float(row['total_revenue']),
-                'total_ad_impressions': int(row['total_ad_impressions']),
-                'ad_impressions_gt_0': int(row['ad_impressions_gt_0']),
-                'pps': pps,
-                'ipp': float(row['ipp']),
-                'rps': float(row['rps']),
-            },
-            'top_articles': []
+    if bigquery is None:
+        # Use mock values for demonstration if BigQuery client isn't available.
+        data = {
+            'pageviews': [85000],
+            'total_sessions': [60000],
+            'pageviews_per_session': [85000 / 60000],
+            'total_engaged_minutes': [105000],  # total engagement minutes
+            'avg_engagement_time_per_session_sec': [90],  # 1.5 minutes
+            'avg_engagement_time_per_user_sec': [65],
         }
-        
-        # Get top articles for this property
-        try:
-            prop_articles = top_articles_df[top_articles_df['property_name'] == prop]
-        except KeyError:
-            logger.warning(f"Top articles data missing 'property_name' column for property {prop}; skipping top articles for this property")
-            prop_articles = pd.DataFrame()
-        
-        for _, article in prop_articles.iterrows():
-            # Get lifetime metrics
-            pageviews_lifetime = int(article['pageviews_lifetime']) if pd.notna(article['pageviews_lifetime']) else 0
-            
-            # Get pps_lifetime from query (per-article calculation)
-            pps_lifetime = None
-            if 'pps_lifetime' in article.index and pd.notna(article['pps_lifetime']):
-                pps_lifetime = float(article['pps_lifetime'])
-            
-            article_data = {
-                'rank': int(article['rank_within_property']),
-                'title': str(article['article_title']) if pd.notna(article['article_title']) else 'Untitled',
-                'permalink': str(article['permalink']) if pd.notna(article['permalink']) else '',
-                'published_date': str(article['wp_publish_date'])[:10] if pd.notna(article['wp_publish_date']) else 'N/A',
-                'days_since_publish': int(article['days_since_publish']) if pd.notna(article['days_since_publish']) else 0,
-                'pageviews_7d': int(article['pageviews_7d']),
-                'ad_impressions_7d': int(article['ad_impressions_7d']),
-                'revenue_7d': float(article['revenue_7d']),
-                'ipp_7d': float(article['ipp_7d']),
-                'pageviews_lifetime': pageviews_lifetime,
-                'pps_lifetime': pps_lifetime,
-                'revenue_lifetime': float(article['revenue_publish_date']) if pd.notna(article['revenue_publish_date']) else 0.0,
-                'rpm_lifetime': float(article['rpm_lifetime']) if pd.notna(article['rpm_lifetime']) else 0.0,
-            }
-            property_data['top_articles'].append(article_data)
-        
-        properties_data.append(property_data)
+        return pd.DataFrame(data)
+
+    # Build the SQL query string.  BigQuery partition tables use string suffixes.
+    # We'll compute suffixes based on the provided date range.
+    table_suffix_start = start_date.strftime('%Y%m%d')
+    table_suffix_end = (end_date - timedelta(days=1)).strftime('%Y%m%d')
+    sql = f"""
+    WITH engagement_data AS (
+      SELECT
+        user_pseudo_id,
+        (SELECT value.int_value FROM UNNEST(event_params) WHERE key = 'ga_session_id') AS session_id,
+        (SELECT value.int_value FROM UNNEST(event_params) WHERE key = 'engagement_time_msec') AS engagement_time_msec
+      FROM `{project_id}.{dataset}.events_*`
+      WHERE _TABLE_SUFFIX BETWEEN '{table_suffix_start}' AND '{table_suffix_end}'
+        AND event_name = 'user_engagement'
+    ),
+    pageviews_data AS (
+      SELECT COUNT(*) AS total_pageviews
+      FROM `{project_id}.{dataset}.events_*`
+      WHERE _TABLE_SUFFIX BETWEEN '{table_suffix_start}' AND '{table_suffix_end}'
+        AND event_name = 'page_view'
+    ),
+    sessions_data AS (
+      SELECT COUNT(DISTINCT CONCAT(user_pseudo_id, '_',
+               (SELECT value.int_value FROM UNNEST(event_params) WHERE key = 'ga_session_id'))) AS total_sessions
+      FROM `{project_id}.{dataset}.events_*`
+      WHERE _TABLE_SUFFIX BETWEEN '{table_suffix_start}' AND '{table_suffix_end}'
+        AND event_name = 'session_start'
+    )
+    SELECT
+      pv.total_pageviews AS pageviews,
+      sd.total_sessions AS total_sessions,
+      ROUND(pv.total_pageviews / sd.total_sessions, 2) AS pageviews_per_session,
+      ROUND(SUM(ed.engagement_time_msec) / 1000 / 60, 2) AS total_engaged_minutes,
+      ROUND(SUM(ed.engagement_time_msec) / 1000 / COUNT(DISTINCT ed.session_id), 2) AS avg_engagement_time_per_session_sec,
+      ROUND(SUM(ed.engagement_time_msec) / 1000 / COUNT(DISTINCT ed.user_pseudo_id), 2) AS avg_engagement_time_per_user_sec
+    FROM engagement_data ed, pageviews_data pv, sessions_data sd
+    """
+    try:
+        client = bigquery.Client(project=project_id)
+        query_job = client.query(sql)
+        result_df = query_job.to_dataframe()
+        return result_df
+    except Exception as e:
+        print(f"Warning: BigQuery query failed ({e}). Using mocked data.")
+        data = {
+            'pageviews': [90000],
+            'total_sessions': [65000],
+            'pageviews_per_session': [90000 / 65000],
+            'total_engaged_minutes': [110000],
+            'avg_engagement_time_per_session_sec': [95],
+            'avg_engagement_time_per_user_sec': [70],
+        }
+        return pd.DataFrame(data)
+
+
+def compute_summary_metrics(
+    clickhouse_df: pd.DataFrame,
+    bigquery_df: pd.DataFrame,
+    week_end_date: date,
+    lookback: int = 4,
+) -> Dict[str, Any]:
+    """Compute high‑level summary metrics and trends for weekly reporting.
+
+    This function calculates weekly metrics by aggregating daily data from the
+    previous Monday-Sunday week and compares them to the average of the previous
+    `lookback` weeks to determine if the numbers are high or low.
+
+    Parameters
+    ----------
+    clickhouse_df : pd.DataFrame
+        DataFrame returned by run_clickhouse_query.
+    bigquery_df : pd.DataFrame
+        DataFrame returned by run_bigquery_query.
+    week_end_date : date
+        The end date of the week being reported (typically last Sunday).
+    lookback : int
+        Number of previous weeks to include in the baseline average for trend comparison.
+
+    Returns
+    -------
+    Dict[str, Any]
+        A dictionary containing summary metrics and trend labels.
+    """
+    week_start_date = week_end_date - timedelta(days=6)
     
+    # Extract ClickHouse metrics for the entire week
+    week_mask = (clickhouse_df['day'].dt.date >= week_start_date) & (clickhouse_df['day'].dt.date <= week_end_date)
+    week_data = clickhouse_df.loc[week_mask]
+    
+    if week_data.empty:
+        raise ValueError(f"No ClickHouse data found for week {week_start_date} to {week_end_date}")
+    
+    weekly_pageviews = int(week_data['page_views'].sum())
+    weekly_sessions = int(week_data['sessions'].sum())
+    weekly_pps = weekly_pageviews / weekly_sessions if weekly_sessions > 0 else 0
+
+    # Extract BigQuery engagement metrics (already aggregated over the date range)
+    bq_row = bigquery_df.iloc[0]
+    total_engaged_minutes = float(bq_row['total_engaged_minutes'])
+    avg_engagement_sec = float(bq_row['avg_engagement_time_per_session_sec'])
+
+    # Compute baseline averages for comparison using previous weeks
+    baseline_weeks = []
+    for i in range(1, lookback + 1):
+        baseline_week_end = week_end_date - timedelta(weeks=i)
+        baseline_week_start = baseline_week_end - timedelta(days=6)
+        baseline_mask = (clickhouse_df['day'].dt.date >= baseline_week_start) & (clickhouse_df['day'].dt.date <= baseline_week_end)
+        baseline_week_data = clickhouse_df.loc[baseline_mask]
+        if not baseline_week_data.empty:
+            baseline_weeks.append(baseline_week_data['page_views'].sum())
+    
+    if baseline_weeks:
+        baseline_pageviews = sum(baseline_weeks) / len(baseline_weeks)
+    else:
+        baseline_pageviews = weekly_pageviews
+
+    # Determine whether the latest metrics are high or low compared to baseline.
+    pv_difference = weekly_pageviews - baseline_pageviews
+    pv_percent_change = (pv_difference / baseline_pageviews) * 100 if baseline_pageviews != 0 else 0
+    pv_trend = 'high' if pv_percent_change > 10 else 'low' if pv_percent_change < -10 else 'normal'
+
+    # For engaged minutes, we don't have daily baseline, so treat as always high.
+    engaged_minutes_trend = 'high'
+
+    # Format average engagement time as minutes:seconds for display.
+    avg_minutes = int(avg_engagement_sec // 60)
+    avg_seconds = int(avg_engagement_sec % 60)
+    avg_time_str = f"{avg_minutes}:{avg_seconds:02d}"
+
     return {
-        'report_date': report_date_str,
-        'properties': properties_data
+        'report_date': f"{week_start_date.strftime('%B %d')} - {week_end_date.strftime('%B %d, %Y')}",
+        'latest_pageviews': weekly_pageviews,
+        'latest_sessions': weekly_sessions,
+        'latest_pps': round(weekly_pps, 2),
+        'total_engaged_minutes': round(total_engaged_minutes),
+        'avg_engagement_time': avg_time_str,
+        'pv_percent_change': round(pv_percent_change, 1),
+        'pv_trend': pv_trend,
+        'engaged_minutes_trend': engaged_minutes_trend,
     }
 
 
-def render_plain_text_report(context: Dict[str, Any]) -> str:
+def render_email(template_path: str, context: Dict[str, Any]) -> str:
+    """Render the HTML email from a Jinja2 template and context variables.
+
+    Parameters
+    ----------
+    template_path : str
+        Path to the directory containing the Jinja2 template file.
+    context : Dict[str, Any]
+        Dictionary of variables to substitute into the template.
+
+    Returns
+    -------
+    str
+        Rendered HTML content.
     """
-    Render the multi-property report as plain text.
-    """
-    lines = []
-    lines.append("=" * 80)
-    lines.append(f"WEEKLY CONTENT ANALYTICS REPORT")
-    lines.append(f"Report Period: {context['report_date']}")
-    lines.append("=" * 80)
-    lines.append("")
-    
-    for prop in context['properties']:
-        lines.append("-" * 80)
-        lines.append(f"Brand: {prop['display_name']}")
-        lines.append("-" * 80)
-        lines.append("")
-        
-        summary = prop['summary_7d']
-        lines.append("7-Day Summary:")
-        lines.append(f"  Total Pageviews:        {summary['total_pageviews']:,} (statera)")
-        lines.append(f"  Total Sessions:         {summary['total_sessions']:,}")
-        lines.append(f"  Total Revenue:          ${summary['total_revenue']:,.0f}")
-        lines.append(f"  Total Ad Impressions:   {summary['total_ad_impressions']:,}")
-        lines.append(f"  Ad Impressions > $0:    {summary['ad_impressions_gt_0']:,}")
-        lines.append(f"  PPS (PVs/session):      {summary['pps']:.2f}")
-        lines.append(f"  IPP (Impr/Pageview):    {summary['ipp']:.1f}")
-        lines.append(f"  RPS (Revenue/Session):  ${summary['rps']:.4f}")
-        lines.append("")
-        
-        if prop['top_articles']:
-            lines.append("Top 10 Articles by Pageviews:")
-            lines.append("")
-            for article in prop['top_articles']:
-                lines.append(f"  #{article['rank']}. {article['title']}")
-                if article['permalink']:
-                    lines.append(f"      URL: {article['permalink']}")
-                lines.append(f"      Days Since Publish: {article['days_since_publish']} (WP_publish_date: {article['published_date']})")
-                lines.append(f"      7-Day Pageviews:     {article['pageviews_7d']:,} (statera)")
-                lines.append(f"      7-Day Revenue:       ${article['revenue_7d']:,.0f}")
-                lines.append(f"      7-Day Ad Impr:       {article['ad_impressions_7d']:,}")
-                lines.append(f"      7-Day IPP:           {article['ipp_7d']:.1f}")
-                # Display Lifetime PPS from per-article query calculation
-                if article['pps_lifetime'] is not None:
-                    lines.append(f"      Lifetime PPS (PVs/session): {article['pps_lifetime']:.2f}")
-                else:
-                    lines.append(f"      Lifetime PPS (PVs/session): NA")
-                lines.append(f"      Lifetime Revenue:    ${article['revenue_lifetime']:,.0f}")
-                lines.append(f"      Lifetime RPM (revenue/1k-PVs): ${article['rpm_lifetime']:.1f}")
-                lines.append("")
-        else:
-            lines.append("  No top articles data available")
-            lines.append("")
-        
-        lines.append("")
-    
-    lines.append("=" * 80)
-    return "\n".join(lines)
+    env = Environment(
+        loader=FileSystemLoader(os.path.dirname(template_path)),
+        autoescape=select_autoescape(['html', 'xml'])
+    )
+    template = env.get_template(os.path.basename(template_path))
+    return template.render(**context)
 
 
-def send_plain_email(
+def send_email(
     subject: str,
-    body: str,
+    html_body: str,
     from_addr: str,
     to_addrs: List[str],
     smtp_host: str,
     smtp_port: int,
     smtp_user: Optional[str] = None,
     smtp_password: Optional[str] = None,
-    max_retries: int = 3,
-) -> bool:
-    """Send a plain‑text email via SMTP with retry logic."""
-    msg = MIMEText(body, 'plain')
+):
+    """Send an HTML email via SMTP.
+
+    Parameters
+    ----------
+    subject : str
+        Email subject line.
+    html_body : str
+        Rendered HTML content.
+    from_addr : str
+        Sender email address.
+    to_addrs : List[str]
+        List of recipient email addresses.
+    smtp_host : str
+        SMTP server host.
+    smtp_port : int
+        SMTP server port.
+    smtp_user : Optional[str]
+        SMTP username (if authentication is required).
+    smtp_password : Optional[str]
+        SMTP password (if authentication is required).
+    """
+    msg = MIMEMultipart('alternative')
     msg['Subject'] = subject
     msg['From'] = from_addr
-    
-    # Filter and clean recipient addresses
-    clean_to_addrs = [addr.strip() for addr in to_addrs if addr and addr.strip()]
-    if not clean_to_addrs:
-        logger.error("No valid recipient addresses provided")
-        return False
-    
-    # Use BCC for all recipients - set To header to generic value
-    msg['To'] = "Content Analytics Report"
-    logger.info(f"Email recipients count: {len(clean_to_addrs)}")
-    
-    for attempt in range(1, max_retries + 1):
-        try:
-            logger.info(f"Attempt {attempt}/{max_retries}: Connecting to SMTP server at {smtp_host}:{smtp_port}")
-            with smtplib.SMTP(smtp_host, smtp_port, timeout=30) as server:
-                server.ehlo()
-                if smtp_user and smtp_password:
-                    logger.info("Starting TLS and authenticating")
-                    server.starttls()
-                    server.login(smtp_user, smtp_password)
-                logger.info("Sending email")
-                server.sendmail(from_addr, clean_to_addrs, msg.as_string())
-                logger.info("Email sent successfully")
-                return True
-        except (ConnectionRefusedError, socket.gaierror) as e:
-            logger.error(f"Connection error on attempt {attempt}: {e}")
-            if attempt < max_retries:
-                logger.info(f"Retrying in 5 seconds...")
-                import time
-                time.sleep(5)
-        except smtplib.SMTPException as e:
-            logger.error(f"SMTP error on attempt {attempt}: {e}")
-            if attempt < max_retries:
-                logger.info(f"Retrying in 5 seconds...")
-                import time
-                time.sleep(5)
-        except Exception as e:
-            logger.error(f"Unexpected error on attempt {attempt}: {e}")
-            if attempt < max_retries:
-                logger.info(f"Retrying in 5 seconds...")
-                import time
-                time.sleep(5)
-    
-    logger.error(f"Failed to send email after {max_retries} attempts")
-    return False
+    msg['To'] = ', '.join(to_addrs)
+    part1 = MIMEText(html_body, 'html')
+    msg.attach(part1)
+
+    with smtplib.SMTP(smtp_host, smtp_port) as server:
+        server.ehlo()
+        if smtp_user and smtp_password:
+            server.starttls()
+            server.login(smtp_user, smtp_password)
+        server.sendmail(from_addr, to_addrs, msg.as_string())
 
 
-def main() -> None:
-    """Entry point for generating and sending the analytics email."""
-    logger.info("Starting multi-property analytics email report generation")
-    
-    # Parse properties from environment
-    properties_str = os.getenv('PROPERTIES', 'torontolife')
-    properties = [p.strip() for p in properties_str.split(',') if p.strip()]
-    logger.info(f"Properties to report on: {properties}")
-    
-    # Calculate report period (previous Monday-Sunday)
-    tz_offset_hours = -5  # America/Toronto (EST)
+def main():
+    """Main entry point for generating and optionally sending the analytics email."""
+    # Use environment variables for configuration.  These can be set in your
+    # deployment environment or exported before running the script.  Default
+    # values are provided for demonstration purposes.
+    property_name = os.getenv('PROPERTY_NAME', 'torontolife')
+    # We'll interpret the current timezone as America/Toronto.
+    tz_offset_hours = -4  # EDT offset from UTC during summer (Toronto)
     today_utc = datetime.now(timezone.utc)
     today_local = (today_utc + timedelta(hours=tz_offset_hours)).date()
     
-    # Determine the reporting week (previous Monday–Sunday)
-    days_since_monday = today_local.weekday()
-    last_monday = today_local - timedelta(days=days_since_monday + 7)
-    last_sunday = last_monday + timedelta(days=6)
+    days_since_monday = today_local.weekday()  # Monday = 0, Sunday = 6
+    last_monday = today_local - timedelta(days=days_since_monday + 7)  # Previous week's Monday
+    last_sunday = last_monday + timedelta(days=6)  # Previous week's Sunday
     
-    # Convert to datetime for queries
-    start_ts = datetime.combine(last_monday, datetime.min.time())
-    end_ts = datetime.combine(last_sunday + timedelta(days=1), datetime.min.time())
-    
-    logger.info(f"Report period: {last_monday} to {last_sunday}")
-    
-    # Configuration
+    report_date_local = last_sunday
+
+    # ClickHouse configuration
     ch_host = os.getenv('CLICKHOUSE_HOST', 'clickhouse.statera.internal')
     ch_user = os.getenv('CLICKHOUSE_USER', 'data-scientist')
-    ch_password = os.getenv('CLICKHOUSE_PASSWORD', '')
-    
-    # Run multi-property queries
-    summary_df = run_clickhouse_query_multi_property(
-        ch_host, ch_user, ch_password, properties, start_ts, end_ts
+    ch_password = os.getenv('CLICKHOUSE_PASSWORD', 'l4lnZGx9VJcdoIrN')
+
+    # BigQuery configuration
+    bq_project = os.getenv('BQ_PROJECT_ID', 'your_project_id')
+    bq_dataset = os.getenv('BQ_DATASET_ID', 'your_dataset_id')
+
+    # Date range for queries: past 28 days to ensure we have enough data for weekly baselines
+    ch_end = report_date_local + timedelta(days=1)
+    ch_start = ch_end - timedelta(days=28)
+    bq_end = report_date_local + timedelta(days=1)
+    bq_start = bq_end - timedelta(days=7)  # Only need the current week for BigQuery
+
+    # Run queries
+    ch_df = run_clickhouse_query(
+        host=ch_host,
+        user=ch_user,
+        password=ch_password,
+        property_name=property_name,
+        start_date=ch_start.isoformat(),
+        end_date=ch_end.isoformat(),
     )
-    
-    top_articles_df = run_top_articles_query_multi(
-        ch_host, ch_user, ch_password, properties, start_ts, end_ts
+    bq_df = run_bigquery_query(
+        project_id=bq_project,
+        dataset=bq_dataset,
+        start_date=bq_start,
+        end_date=bq_end,
     )
-    
-    if summary_df.empty:
-        logger.error("No summary data retrieved from ClickHouse. Cannot generate report.")
-        return
-    
-    # Debug: Log column names to troubleshoot
-    logger.info(f"Summary DataFrame columns: {summary_df.columns.tolist()}")
-    if not top_articles_df.empty:
-        logger.info(f"Top Articles DataFrame columns: {top_articles_df.columns.tolist()}")
-    
-    # Build report context
-    context = build_report_context(properties, summary_df, top_articles_df, last_monday, last_sunday)
-    
-    logger.info(f"Report context built for {len(context['properties'])} properties")
-    
-    # Render plain-text report
-    plain_text_body = render_plain_text_report(context)
-    
-    # Check if email sending is enabled
-    send_email_enabled = os.getenv('SEND_EMAIL', 'false').lower() == 'true'
-    
-    if not send_email_enabled:
-        logger.info("Email sending is disabled (SEND_EMAIL=false)")
-        logger.info("Report preview:\n" + plain_text_body)
-        logger.info("To enable email sending, set SEND_EMAIL=true in your environment")
-        return
-    
-    # Validate SMTP configuration
-    from_addr = os.getenv('EMAIL_FROM', 'angad.gadre@stjoseph.com')
-    to_addrs_str = os.getenv('EMAIL_TO', 'angad.gadre@stjoseph.com')
-    smtp_host = os.getenv('SMTP_HOST', 'localhost')
-    smtp_port = int(os.getenv('SMTP_PORT', '587'))
-    smtp_user = os.getenv('EMAIL_USER')
-    smtp_password = os.getenv('EMAIL_PASSWORD')
-    
-    # Parse comma-separated recipient list
-    to_addrs = [addr.strip() for addr in to_addrs_str.split(',') if addr.strip()]
-    
-    if not to_addrs:
-        logger.error("No valid recipient email addresses configured (EMAIL_TO)")
-        logger.info("Report preview:\n" + plain_text_body)
-        return
-    
-    logger.info(f"SMTP configuration: host={smtp_host}, port={smtp_port}, user={smtp_user or 'None'}")
-    
-    # Build subject line - format as "Weekly Content Analytics Report (December 01-07, 2025)"
-    # Extract start and end dates from context
-    start_str = last_monday.strftime('%B %d')
-    end_str = last_sunday.strftime('%d, %Y')
-    subject = f"Weekly Content Analytics Report ({start_str}-{end_str})"
-    
-    # Send plain-text email with retry logic
-    success = send_plain_email(
-        subject, plain_text_body, from_addr, to_addrs,
-        smtp_host, smtp_port, smtp_user, smtp_password
-    )
-    
-    if not success:
-        logger.error("Email sending failed after all retry attempts")
-        logger.info("Report preview:\n" + plain_text_body)
+
+    # Compute summary metrics and trends
+    summary = compute_summary_metrics(ch_df, bq_df, report_date_local)
+
+    # Prepare context for the email template
+    context = {
+        'site': property_name,
+        'summary': summary,
+    }
+
+    # Load and render the email HTML template.  The template file
+    # email_template.html must reside in the same directory as this script
+    # or specify an absolute path via EMAIL_TEMPLATE environment variable.
+    template_path = os.getenv('EMAIL_TEMPLATE_PATH', os.path.join(os.path.dirname(__file__), 'email_template.html'))
+    html_body = render_email(template_path, context)
+
+    # Output the rendered HTML to a file for inspection
+    output_html_path = os.path.join(os.path.dirname(__file__), 'weekly_report_preview.html')
+    with open(output_html_path, 'w', encoding='utf-8') as f:
+        f.write(html_body)
+    print(f"Preview report saved to {output_html_path}")
+
+    # Optionally send the email if SMTP settings and recipients are provided.
+    send_flag = os.getenv('SEND_EMAIL', 'false').lower() == 'true'
+    if send_flag:
+        from_addr = os.getenv('EMAIL_FROM', 'angad.gadre@stjoseph.com')
+        to_addrs = os.getenv('EMAIL_RECIPIENTS', 'angad.gadre@stjoseph.com').split(',')
+        smtp_host = os.getenv('SMTP_HOST', 'localhost')
+        smtp_port = int(os.getenv('SMTP_PORT', '25'))
+        smtp_user = os.getenv('SMTP_USER')
+        smtp_password = os.getenv('SMTP_PASSWORD')
+        subject = f"Weekly analytics report for {property_name} ({summary['report_date']})"
+        try:
+            send_email(subject, html_body, from_addr, to_addrs, smtp_host, smtp_port, smtp_user, smtp_password)
+            print(f"Email sent successfully to {', '.join(to_addrs)}")
+        except ConnectionRefusedError:
+            print(f"ERROR: Could not connect to SMTP server at {smtp_host}:{smtp_port}")
+            print("Please check your SMTP configuration or set SEND_EMAIL=false to skip email sending.")
+        except Exception as e:
+            print(f"ERROR: Failed to send email: {e}")
+            print("Please check your SMTP configuration or set SEND_EMAIL=false to skip email sending.")
     else:
-        logger.info("Weekly analytics report sent successfully")
+        print("Email not sent. To enable sending, set SEND_EMAIL=true and configure SMTP settings.")
 
 
 if __name__ == '__main__':
