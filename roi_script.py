@@ -12,7 +12,7 @@ CLICKHOUSE_HOST = 'clickhouse.statera.internal'
 # CLICKHOUSE_USER = os.getenv('CLICKHOUSE_USER', 'default')
 CLICKHOUSE_USER = 'data-scientist'
 # CLICKHOUSE_PASSWORD = os.getenv('CLICKHOUSE_PASSWORD', '')
-CLICKHOUSE_PASSWORD = 'l4lnZGx9VJcdoIrN'
+CLICKHOUSE_PASSWORD = ''
 
 # OUTPUT_DIR = os.getenv('OUTPUT_DIR', './output')
 OUTPUT_DIR = '/Users/angad.gadre/Documents/Code repo/Data_Apps/Data/'
