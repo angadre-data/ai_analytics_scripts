@@ -10,7 +10,7 @@ from clickhouse_connect import get_client
 host = 'clickhouse.statera.internal'
 port = 8123
 username = 'data-scientist'
-password = 'l4lnZGx9VJcdoIrN'
+password = ''
 
 # SQL query to fetch data
 sql_query = '''select * from assembly.client_events ce limit 100'''
